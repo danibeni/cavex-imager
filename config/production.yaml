@@ -1,0 +1,50 @@
+service:
+  name: cavex_imager
+  version: 1.0.0
+  log_level: INFO
+
+indigo:
+  host: 172.17.0.1
+  port: 7624
+  device_name: CAVEXCam
+  reconnect:
+    enabled: true
+    max_attempts: 0
+    backoff_max_s: 30
+
+auth:
+  enabled: true
+  keys:
+    - key: "cavex_manager_key_12345"
+      owner: "cavex_manager"
+      priority: 100
+    - key: "engineering_key_67890"
+      owner: "engineering"
+      priority: 50
+
+lease:
+  preempt_mode: graceful
+  default_ttl_seconds: 120
+  max_ttl_seconds: 600
+
+storage:
+  host_base_path: /opt/cavex/data
+  container_base_path: /data
+  min_free_gb: 10
+  default_file_prefix: cavex
+  default_naming_pattern: "{prefix}_{seq:04d}.fits"
+
+telemetry:
+  default_rate_hz: 1
+  max_ws_clients: 10
+
+logging:
+  stdout:
+    enabled: true
+    format: json
+  file:
+    enabled: true
+    path: /data/logs/cavex_imager.log
+    max_bytes: 10485760
+    backup_count: 5
+    compress: true
