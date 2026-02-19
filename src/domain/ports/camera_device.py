@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 
 @dataclass
@@ -102,4 +102,33 @@ class ICameraDevice(ABC):
 
         Returns:
             Snapshot of current camera state.
+        """
+
+    @abstractmethod
+    def subscribe_to_exposure_events(
+        self,
+        on_state_changed: Callable[[str, str], Awaitable[None]] | None = None,
+        on_image_received: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
+        """Subscribe to camera exposure-related events.
+
+        Args:
+            on_state_changed: Callback(previous_state, current_state) when
+                exposure state changes.
+            on_image_received: Callback(file_path) when image file is received.
+        """
+
+    @abstractmethod
+    def subscribe_to_thermal_events(
+        self,
+        on_temperature_changed: Callable[[float, float], Awaitable[None]] | None = None,
+        on_cooler_state_changed: Callable[[str, str], Awaitable[None]] | None = None,
+    ) -> None:
+        """Subscribe to camera thermal-related events.
+
+        Args:
+            on_temperature_changed: Callback(current_temp, target_temp) when
+                temperature changes.
+            on_cooler_state_changed: Callback(previous_state, current_state)
+                when cooler state changes.
         """

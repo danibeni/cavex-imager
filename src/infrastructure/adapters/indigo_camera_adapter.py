@@ -1,17 +1,29 @@
-"""INDIGO-based camera adapter with local state cache."""
+"""Event-driven INDIGO camera adapter with local state cache.
+
+Subscribes to INDIGO property callbacks (define/update/delete) on a specific
+device and maintains an internal cache of camera state.  No polling is used;
+all state changes are pushed by the INDIGO server.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import structlog
 
 from src.domain.ports.camera_device import CameraStateSnapshot, ICameraDevice
-from src.infrastructure.adapters.indigo_client import IndigoClient
+from src.infrastructure.adapters.indigo_client import (
+    IndigoClient,
+    IndigoProperty,
+)
 
 logger = structlog.get_logger(__name__)
+
+# Delay before device auto-reconnect attempt (seconds)
+_DEVICE_AUTOCONNECT_DELAY = 5
 
 # INDIGO property names
 _PROP_CONNECTION = "CONNECTION"
@@ -27,6 +39,7 @@ _PROP_CCD_OFFSET = "CCD_OFFSET"
 _PROP_CCD_LOCAL_MODE = "CCD_LOCAL_MODE"
 _PROP_CCD_UPLOAD_MODE = "CCD_UPLOAD_MODE"
 _PROP_CCD_IMAGE = "CCD_IMAGE"
+_PROP_CCD_IMAGE_FILE = "CCD_IMAGE_FILE"
 _PROP_CCD_FRAME_TYPE = "CCD_FRAME_TYPE"
 
 
@@ -35,17 +48,26 @@ def _now_utc() -> datetime:
 
 
 class IndigoCameraAdapter(ICameraDevice):
-    """ICameraDevice implementation backed by INDIGO protocol."""
+    """ICameraDevice backed by INDIGO protocol using event-driven callbacks.
 
-    def __init__(self, device_name: str) -> None:
-        """Initialize adapter with device name.
+    The INDIGO server pushes property definitions (defXXXVector), updates
+    (setXXXVector) and deletions (deleteProperty). This adapter registers
+    callbacks for a specific device and keeps a local state cache in sync.
+    No polling loops are used.
+    """
+
+    def __init__(self, device_name: str, auto_connect: bool = True) -> None:
+        """Initialize adapter.
 
         Args:
-            device_name: INDIGO device identifier.
+            device_name: INDIGO device identifier (e.g. 'CCD Imager Simulator').
+            auto_connect: Auto-connect device when CONNECTION shows disconnected.
         """
         self._device_name = device_name
         self._client = IndigoClient()
-        self._event_task: asyncio.Task[None] | None = None
+        self._auto_connect = auto_connect
+        self._autoconnect_task: asyncio.Task[None] | None = None
+        logger.info("adapter_initialized", device_name=device_name)
 
         # Local state cache
         self._connected = False
@@ -67,23 +89,34 @@ class IndigoCameraAdapter(ICameraDevice):
         self._local_mode_dir: str | None = None
         self._last_update = _now_utc()
 
+        # Event handlers
+        self._exposure_state_handlers: list[Callable[[str, str], Awaitable[None]]] = []
+        self._image_received_handlers: list[Callable[[str], Awaitable[None]]] = []
+        self._temperature_changed_handlers: list[Callable[[float, float], Awaitable[None]]] = []
+        self._cooler_state_changed_handlers: list[Callable[[str, str], Awaitable[None]]] = []
+
+    # ── Connection Lifecycle ─────────────────────────────────────────
+
     async def connect(self, host: str, port: int) -> None:
-        """Connect to INDIGO server and start cache updater."""
+        """Connect to INDIGO server and register event callbacks.
+
+        Args:
+            host: INDIGO server host.
+            port: INDIGO server port (default 7624).
+        """
+        # Register callbacks BEFORE connecting so we don't miss the def flood
+        dev = self._device_name
+        self._client.on_define(self._on_property_defined, device=dev)
+        self._client.on_update(self._on_property_updated, device=dev)
+        self._client.on_delete(self._on_property_deleted, device=dev)
+
         await self._client.connect(host, port)
         self._connected = True
-        self._event_task = asyncio.create_task(self._cache_updater())
-        logger.info("adapter_connected", device=self._device_name, host=host, port=port)
+        logger.info("adapter_connected", device=dev, host=host, port=port)
 
     async def disconnect(self) -> None:
         """Disconnect device and close INDIGO client."""
-        if self._event_task is not None:
-            self._event_task.cancel()
-            try:
-                await self._event_task
-            except asyncio.CancelledError:
-                pass
-            self._event_task = None
-
+        self._cancel_autoconnect()
         await self._client.disconnect()
         self._connected = False
         self._device_connected = False
@@ -102,6 +135,8 @@ class IndigoCameraAdapter(ICameraDevice):
             self._device_name, _PROP_CONNECTION, {"CONNECTED": False, "DISCONNECTED": True}
         )
         logger.info("device_disconnect_requested", device=self._device_name)
+
+    # ── Configuration Commands ───────────────────────────────────────
 
     async def set_config(self, config: dict[str, Any]) -> None:
         """Apply acquisition configuration to camera.
@@ -149,14 +184,17 @@ class IndigoCameraAdapter(ICameraDevice):
         logger.info("config_applied", device=self._device_name, config=config)
 
     async def set_local_mode(self, directory: str, prefix: str) -> None:
-        """Configure INDIGO local save mode."""
-        # Set upload mode to LOCAL
+        """Configure INDIGO local save mode.
+
+        Args:
+            directory: Storage directory path (host-side).
+            prefix: Filename prefix for saved images.
+        """
         await self._client.send_switch(
             self._device_name,
             _PROP_CCD_UPLOAD_MODE,
             {"LOCAL": True, "CLIENT": False, "BOTH": False},
         )
-        # Set directory and prefix
         await self._client.send_text(
             self._device_name, _PROP_CCD_LOCAL_MODE, {"DIR": directory, "PREFIX": prefix}
         )
@@ -164,7 +202,11 @@ class IndigoCameraAdapter(ICameraDevice):
         logger.info("local_mode_set", device=self._device_name, dir=directory, prefix=prefix)
 
     async def start_exposure(self, exptime_s: float) -> None:
-        """Start a camera exposure."""
+        """Start a camera exposure.
+
+        Args:
+            exptime_s: Exposure time in seconds.
+        """
         await self._client.send_number(
             self._device_name, _PROP_CCD_EXPOSURE, {"EXPOSURE": exptime_s}
         )
@@ -183,7 +225,7 @@ class IndigoCameraAdapter(ICameraDevice):
         return CameraStateSnapshot(
             device_name=self._device_name,
             connected=self._device_connected,
-            indigo_connected=self._connected,
+            indigo_connected=self._client.is_connected,
             exposure_state=self._exposure_state,
             exposure_value=self._exposure_value,
             exposure_target=self._exposure_target,
@@ -202,125 +244,268 @@ class IndigoCameraAdapter(ICameraDevice):
             last_update=self._last_update,
         )
 
-    # ── Cache updater from INDIGO events ────────────────────────────
+    def subscribe_to_exposure_events(
+        self,
+        on_state_changed: Callable[[str, str], Awaitable[None]] | None = None,
+        on_image_received: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
+        """Register exposure event handlers."""
+        if on_state_changed is not None:
+            self._exposure_state_handlers.append(on_state_changed)
+        if on_image_received is not None:
+            self._image_received_handlers.append(on_image_received)
 
-    async def _cache_updater(self) -> None:
-        """Background task that updates local cache from INDIGO events."""
+    def subscribe_to_thermal_events(
+        self,
+        on_temperature_changed: Callable[[float, float], Awaitable[None]] | None = None,
+        on_cooler_state_changed: Callable[[str, str], Awaitable[None]] | None = None,
+    ) -> None:
+        """Register thermal event handlers."""
+        if on_temperature_changed is not None:
+            self._temperature_changed_handlers.append(on_temperature_changed)
+        if on_cooler_state_changed is not None:
+            self._cooler_state_changed_handlers.append(on_cooler_state_changed)
+
+    # ── INDIGO Event Callbacks (event-driven, no polling) ────────────
+
+    async def _on_property_defined(self, prop: IndigoProperty) -> None:
+        """Handle defXXXVector: property announced by the server.
+
+        Processes initial values (def carries current state) and triggers
+        auto-connect / BLOB enablement when relevant properties appear.
+        """
+        self._apply_property_to_cache(prop)
+
+        # Auto-connect device when CONNECTION shows disconnected
+        if prop.name == _PROP_CONNECTION and self._auto_connect:
+            connected = prop.items.get("CONNECTED")
+            if connected and not connected.value_switch:
+                await self.connect_device()
+
+        # Enable BLOB URL transfer when CCD_IMAGE property appears
+        if prop.name == _PROP_CCD_IMAGE:
+            await self._client.enable_blob(self._device_name, _PROP_CCD_IMAGE, "URL")
+
+    async def _on_property_updated(self, prop: IndigoProperty) -> None:
+        """Handle setXXXVector: property value update pushed by the server."""
+        previous_exposure_state = self._exposure_state
+        previous_temp = self._ccd_temp_c
+        previous_target = self._cooler_target_c
+        previous_cooler_state = self._cooler_state
+        previous_image_path = self._last_image_path
+
+        self._apply_property_to_cache(prop)
+
+        if (
+            prop.name == _PROP_CCD_EXPOSURE
+            and previous_exposure_state != self._exposure_state
+            and self._exposure_state_handlers
+        ):
+            await self._notify_exposure_state_changed(previous_exposure_state, self._exposure_state)
+
+        if (
+            prop.name == _PROP_CCD_IMAGE_FILE
+            and self._last_image_path
+            and self._last_image_path != previous_image_path
+            and os.path.isfile(self._last_image_path)
+            and self._image_received_handlers
+        ):
+            await self._notify_image_received(self._last_image_path)
+
+        if (
+            prop.name == _PROP_CCD_TEMP
+            and (previous_temp != self._ccd_temp_c or previous_target != self._cooler_target_c)
+            and self._temperature_changed_handlers
+        ):
+            await self._notify_temperature_changed(self._ccd_temp_c, self._cooler_target_c)
+
+        if (
+            prop.name in {_PROP_CCD_COOLER, _PROP_CCD_COOLER_POWER, _PROP_CCD_TEMP}
+            and previous_cooler_state != self._cooler_state
+            and self._cooler_state_changed_handlers
+        ):
+            await self._notify_cooler_state_changed(previous_cooler_state, self._cooler_state)
+
+        # Schedule device auto-reconnect if CONNECTION went OFF
+        if prop.name == _PROP_CONNECTION and self._auto_connect:
+            connected = prop.items.get("CONNECTED")
+            if connected and not connected.value_switch:
+                self._schedule_autoconnect()
+
+    async def _on_property_deleted(self, device: str, property_name: str) -> None:
+        """Handle deleteProperty: device removed or property unavailable."""
+        if not property_name:
+            # All device properties deleted — device fully removed
+            logger.warning("device_removed", device=device)
+            self._device_connected = False
+            self._reset_cache()
+        else:
+            logger.debug("property_deleted", device=device, property=property_name)
+
+    # ── Cache Update from Typed Properties ───────────────────────────
+
+    def _apply_property_to_cache(self, prop: IndigoProperty) -> None:
+        """Update local camera state from a typed IndigoProperty."""
+        self._last_update = _now_utc()
+
+        if prop.name == _PROP_CONNECTION:
+            item = prop.items.get("CONNECTED")
+            if item is not None:
+                self._device_connected = item.value_switch
+
+        elif prop.name == _PROP_CCD_EXPOSURE:
+            if prop.state is not None:
+                self._exposure_state = prop.state.value
+            item = prop.items.get("EXPOSURE")
+            if item is not None:
+                self._exposure_value = item.value_number
+                if item.target_number > 0:
+                    self._exposure_target = item.target_number
+
+        elif prop.name == _PROP_CCD_TEMP:
+            item = prop.items.get("TEMPERATURE")
+            if item is not None:
+                self._ccd_temp_c = item.value_number
+                self._cooler_target_c = item.target_number
+
+        elif prop.name == _PROP_CCD_COOLER:
+            item = prop.items.get("ON")
+            if item is not None:
+                self._cooler_on = item.value_switch
+            self._derive_cooler_state()
+
+        elif prop.name == _PROP_CCD_COOLER_POWER:
+            item = prop.items.get("POWER")
+            if item is not None:
+                self._cooler_power_pct = item.value_number
+            self._derive_cooler_state()
+
+        elif prop.name == _PROP_CCD_BIN:
+            h = prop.items.get("HORIZONTAL")
+            v = prop.items.get("VERTICAL")
+            if h is not None:
+                self._bin_x = int(h.value_number)
+            if v is not None:
+                self._bin_y = int(v.value_number)
+
+        elif prop.name == _PROP_CCD_FRAME:
+            left = prop.items.get("LEFT")
+            top = prop.items.get("TOP")
+            width = prop.items.get("WIDTH")
+            height = prop.items.get("HEIGHT")
+            self._roi = (
+                int(left.value_number) if left else 0,
+                int(top.value_number) if top else 0,
+                int(width.value_number) if width else 0,
+                int(height.value_number) if height else 0,
+            )
+
+        elif prop.name == _PROP_CCD_GAIN:
+            item = prop.items.get("GAIN")
+            if item is not None:
+                self._gain = int(item.value_number)
+
+        elif prop.name == _PROP_CCD_OFFSET:
+            item = prop.items.get("OFFSET")
+            if item is not None:
+                self._offset = int(item.value_number)
+
+        elif prop.name == _PROP_CCD_IMAGE:
+            item = prop.items.get("IMAGE")
+            if item is not None and item.value_blob_url:
+                self._last_image_path = item.value_blob_url
+
+        elif prop.name == _PROP_CCD_IMAGE_FILE:
+            item = prop.items.get("FILE")
+            if item is not None and item.value_text:
+                self._last_image_path = item.value_text
+
+        elif prop.name == _PROP_CCD_LOCAL_MODE:
+            item = prop.items.get("DIR")
+            if item is not None and item.value_text:
+                self._local_mode_dir = item.value_text
+
+    # ── Internal Helpers ─────────────────────────────────────────────
+
+    def _derive_cooler_state(self) -> None:
+        """Derive cooler state string from current readings."""
+        if not self._cooler_on:
+            self._cooler_state = "OFF"
+        elif self._cooler_power_pct >= 99:
+            self._cooler_state = "ALARM"
+        elif abs(self._ccd_temp_c - self._cooler_target_c) < 1.0:
+            self._cooler_state = "STABLE"
+        else:
+            self._cooler_state = "RAMPING"
+
+    def _reset_cache(self) -> None:
+        """Reset all cached values to defaults (device removed/disconnected)."""
+        self._exposure_state = "IDLE"
+        self._exposure_value = 0.0
+        self._exposure_target = 0.0
+        self._ccd_temp_c = 0.0
+        self._cooler_target_c = 0.0
+        self._cooler_power_pct = 0.0
+        self._cooler_on = False
+        self._cooler_state = "OFF"
+        self._bin_x = 1
+        self._bin_y = 1
+        self._roi = (0, 0, 0, 0)
+        self._gain = None
+        self._offset = None
+        self._last_image_path = None
+        self._local_mode_dir = None
+
+    def _schedule_autoconnect(self) -> None:
+        """Schedule a delayed device auto-reconnect attempt."""
+        if self._autoconnect_task is not None and not self._autoconnect_task.done():
+            return  # Already pending
+        self._autoconnect_task = asyncio.create_task(self._delayed_autoconnect())
+
+    async def _delayed_autoconnect(self) -> None:
+        """Wait then attempt to reconnect the device."""
         try:
-            async for event in self._client.event_stream():
-                device = event.get("device")
-                if device and device != self._device_name:
-                    continue
-                self._update_cache(event)
+            await asyncio.sleep(_DEVICE_AUTOCONNECT_DELAY)
+            if self._connected and not self._device_connected and self._auto_connect:
+                logger.info("device_autoconnect_attempt", device=self._device_name)
+                await self.connect_device()
         except asyncio.CancelledError:
             return
 
-    def _update_cache(self, event: dict[str, Any]) -> None:
-        """Update local cache fields from an INDIGO event.
+    def _cancel_autoconnect(self) -> None:
+        """Cancel any pending autoconnect task."""
+        if self._autoconnect_task is not None:
+            self._autoconnect_task.cancel()
+            self._autoconnect_task = None
 
-        Args:
-            event: Parsed INDIGO event dictionary.
-        """
-        prop = event.get("property", "")
-        values = event.get("values", {})
-        state = event.get("state", "")
-        self._last_update = _now_utc()
-
-        if prop == _PROP_CONNECTION:
-            connected_val = values.get("CONNECTED", "").lower()
-            self._device_connected = connected_val in ("on", "true", "1")
-
-        elif prop == _PROP_CCD_EXPOSURE:
-            self._exposure_state = state or "IDLE"
-            exp_val = values.get("EXPOSURE", "")
-            if exp_val:
-                try:
-                    self._exposure_value = float(exp_val)
-                except ValueError:
-                    pass
-
-        elif prop == _PROP_CCD_TEMP:
-            temp = values.get("TEMPERATURE", "")
-            if temp:
-                try:
-                    self._ccd_temp_c = float(temp)
-                except ValueError:
-                    pass
-            target = values.get("TARGET", values.get("TEMPERATURE", ""))
-            if target and state == "Ok":
-                try:
-                    self._cooler_target_c = float(target)
-                except ValueError:
-                    pass
-
-        elif prop == _PROP_CCD_COOLER:
-            self._cooler_on = values.get("ON", "").lower() in ("on", "true", "1")
-
-        elif prop == _PROP_CCD_COOLER_POWER:
-            pwr = values.get("POWER", "")
-            if pwr:
-                try:
-                    self._cooler_power_pct = float(pwr)
-                except ValueError:
-                    pass
-            # Derive cooler state
-            if not self._cooler_on:
-                self._cooler_state = "OFF"
-            elif self._cooler_power_pct >= 99:
-                self._cooler_state = "ALARM"
-            elif abs(self._ccd_temp_c - self._cooler_target_c) < 1.0:
-                self._cooler_state = "STABLE"
-            else:
-                self._cooler_state = "RAMPING"
-
-        elif prop == _PROP_CCD_BIN:
-            h = values.get("HORIZONTAL", "")
-            v = values.get("VERTICAL", "")
-            if h:
-                try:
-                    self._bin_x = int(float(h))
-                except ValueError:
-                    pass
-            if v:
-                try:
-                    self._bin_y = int(float(v))
-                except ValueError:
-                    pass
-
-        elif prop == _PROP_CCD_FRAME:
+    async def _notify_exposure_state_changed(self, previous: str, current: str) -> None:
+        """Invoke subscribed handlers for exposure state changes."""
+        for handler in self._exposure_state_handlers:
             try:
-                self._roi = (
-                    int(float(values.get("LEFT", "0"))),
-                    int(float(values.get("TOP", "0"))),
-                    int(float(values.get("WIDTH", "0"))),
-                    int(float(values.get("HEIGHT", "0"))),
-                )
-            except ValueError:
-                pass
+                await handler(previous, current)
+            except Exception as error:
+                logger.exception("exposure_state_handler_failed", error=str(error))
 
-        elif prop == _PROP_CCD_GAIN:
-            g = values.get("GAIN", "")
-            if g:
-                try:
-                    self._gain = int(float(g))
-                except ValueError:
-                    pass
+    async def _notify_image_received(self, file_path: str) -> None:
+        """Invoke subscribed handlers when image path is available."""
+        for handler in self._image_received_handlers:
+            try:
+                await handler(file_path)
+            except Exception as error:
+                logger.exception("image_received_handler_failed", error=str(error))
 
-        elif prop == _PROP_CCD_OFFSET:
-            o = values.get("OFFSET", "")
-            if o:
-                try:
-                    self._offset = int(float(o))
-                except ValueError:
-                    pass
+    async def _notify_temperature_changed(self, current_temp: float, target_temp: float) -> None:
+        """Invoke subscribed handlers for temperature changes."""
+        for handler in self._temperature_changed_handlers:
+            try:
+                await handler(current_temp, target_temp)
+            except Exception as error:
+                logger.exception("temperature_handler_failed", error=str(error))
 
-        elif prop == _PROP_CCD_IMAGE:
-            # INDIGO reports the filename via the BLOB property
-            img_val = values.get("IMAGE", "")
-            if img_val:
-                self._last_image_path = img_val
-
-        elif prop == _PROP_CCD_LOCAL_MODE:
-            d = values.get("DIR", "")
-            if d:
-                self._local_mode_dir = d
+    async def _notify_cooler_state_changed(self, previous: str, current: str) -> None:
+        """Invoke subscribed handlers for cooler state changes."""
+        for handler in self._cooler_state_changed_handlers:
+            try:
+                await handler(previous, current)
+            except Exception as error:
+                logger.exception("cooler_state_handler_failed", error=str(error))
