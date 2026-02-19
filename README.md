@@ -120,6 +120,20 @@ docker run -p 8001:8000 \
 - **[Technical Spec](docs/CAVEX_IMAGER_Technical_Spec_v1.3.md)** – API details, schemas, workflows
 - **[Service Overview](docs/SERVICE_OVERVIEW.md)** – Component overview, extension guide
 
-## License & Contact
+## License
 
-CAVEX_V2 Team · Calar Alto Observatory · cavex-dev@caha.es
+This project is free software, released under a license compatible with [INDIGO Astronomy](http://www.indigo-astronomy.org/) (BSD-style). See the repository for the full license text.
+
+## Development Team
+
+**CAHA Staff**
+- Daniel Benítez – dbenitez@caha.es
+- Julio Marín – jmarin@caha.es
+- Juan Francisco López – jfran@caha.es
+
+**UAL members**
+- Raúl Ortega Pérez – rop462@inlumine.ual.es
+- Juanjo Moreno – juanjomoreno@ual.es
+- Vicente González Ruiz – vruiz@ual.es
+
+**Contact:** Calar Alto Observatory · cavex-dev@caha.es
