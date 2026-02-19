@@ -15,6 +15,8 @@ build/
 .DS_Store
 ai/
 AGENTS.md
+*.log
+logs/
 
 # Log files
 *.log
