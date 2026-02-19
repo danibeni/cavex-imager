@@ -136,4 +136,4 @@ This project is free software, released under a license compatible with [INDIGO 
 - Juanjo Moreno – juanjomoreno@ual.es
 - Vicente González Ruiz – vruiz@ual.es
 
-**Contact:** Calar Alto Observatory · cavex-dev@caha.es
+
