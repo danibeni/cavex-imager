@@ -16,3 +16,7 @@ build/
 ai/
 AGENTS.md
 
+# Log files
+*.log
+logs/
+
