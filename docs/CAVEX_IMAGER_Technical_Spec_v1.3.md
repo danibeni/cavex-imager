@@ -2,7 +2,8 @@
 
 **Proyecto:** CAVEX_V2 - Renovación del Monitor de Extinción de Calar Alto  
 **Versión:** 1.3  
-**Fecha:** 2026-02-12  
+**Fecha:** 2026-02-19  
+**Cambios v1.3 (2026-02-19):** Validación FITS (astropy), \`image_valid\`/\`image_error\` en eventos, \`last_capture\` en API status, consolidación de \`image_ready\` en \`capture_done\`, troubleshooting exposición/INDIGO.  
 **Autor:** Equipo CAVEX_V2  
 
 ---
@@ -263,11 +264,11 @@ sequenceDiagram
     Note over INDIGO: Exposición en curso (3s)
 
     INDIGO-->>ADAPTER: setNumberVector(CCD_EXPOSURE=OK)
-    INDIGO-->>ADAPTER: setBLOBVector(filename)
-    ADAPTER->>FS: Verificar FITS existe
-    ADAPTER->>FS: Escribir sidecar JSON
-    ADAPTER->>WS: publish_event(capture_done)
-    ADAPTER->>WS: publish_event(image_ready)
+    INDIGO-->>ADAPTER: setTextVector(CCD_IMAGE_FILE) / setBLOBVector
+    ADAPTER->>UC: callbacks (state Ok + image path)
+    UC->>UC: Validar FITS (astropy)
+    UC->>FS: Escribir sidecar JSON
+    UC->>WS: publish_event(capture_done, image_valid, sidecar_written)
 ```
 
 ---
@@ -307,15 +308,16 @@ sequenceDiagram
 ### 4.4 Dependencias Python Principales
 
 \`\`\`python
-# requirements.txt
-fastapi==0.110.0
-uvicorn[standard]==0.27.0
-pydantic==2.6.0
-structlog==24.1.0
-pytest==8.0.0
-pytest-asyncio==0.23.0
-httpx==0.26.0  # Cliente HTTP para testing
-websockets==12.0  # Cliente WS para testing
+# pyproject.toml / poetry
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.6.0
+structlog>=24.1.0
+astropy>=7.0.0  # FITS validation (adapter-agnostic)
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx>=0.26.0  # Cliente HTTP para testing
+websockets>=12.0  # Cliente WS para testing
 \`\`\`
 
 ### 4.5 Decisiones Técnicas Clave
@@ -524,11 +526,9 @@ flowchart TB
     HUB -->|Discreto| CAP["capture_event<br/>(started/done/failed/aborted)"]
     HUB -->|Discreto| LEASE["lease_event<br/>(acquired/preempted/expired)"]
     HUB -->|Discreto| ALARM["alarm_event<br/>(temperatura/cooler/disco)"]
-    HUB -->|Discreto| IMG["image_ready<br/>(FITS + JSON disponibles)"]
 
     style SNAP fill:#4CAF50,stroke:#2E7D32,stroke-width:2px,color:#fff
     style ALARM fill:#F44336,stroke:#B71C1C,stroke-width:2px,color:#fff
-    style IMG fill:#2196F3,stroke:#0D47A1,stroke-width:2px,color:#fff
 ```
 
 #### Ejemplo de Mensaje
@@ -574,7 +574,26 @@ flowchart TB
 }
 ```
 
-### 5.4 FilesystemAdapter
+### 5.4 Validador de Imágenes (FitsValidator)
+
+El servicio valida que cada imagen FITS recibida sea estructuralmente correcta mediante **astropy**, de forma **independiente del adaptador** (INDIGO u otro).
+
+#### Responsabilidades
+
+- Verificar que el archivo existe y no está vacío
+- Abrir el FITS con `astropy.io.fits` y validar header y datos del HDU primario
+- Devolver `(is_valid, error_message)` para el evento `capture.completed`
+
+#### Puerto de Dominio
+
+```python
+class IImageValidator(ABC):
+    def validate(self, file_path: str) -> tuple[bool, str | None]: ...
+```
+
+El resultado (`image_valid`, `image_error`) se expone en el evento WebSocket `capture_done` y en `GET /camera/status` → `last_capture`.
+
+### 5.5 FilesystemAdapter
 
 #### Responsabilidades
 
@@ -701,13 +720,12 @@ sequenceDiagram
     end
 
     IND-->>ADAPTER: setNumberVector(CCD_EXPOSURE, state=OK)
-    IND-->>ADAPTER: setBLOBVector(CCD_IMAGE, filename="cavex_0042.fits")
-    ADAPTER->>FS: Verificar FITS existe
-    FS-->>ADAPTER: Existe (120MB)
-    ADAPTER->>FS: Escribir sidecar JSON
-    FS-->>ADAPTER: JSON escrito
-    ADAPTER->>WS: publish_event(capture_done)
-    ADAPTER->>WS: publish_event(image_ready)
+    IND-->>ADAPTER: setTextVector(CCD_IMAGE_FILE) / setBLOBVector
+    ADAPTER->>IMG: callbacks (state Ok + image path)
+    IMG->>IMG: Validar FITS (FitsValidator/astropy)
+    IMG->>FS: Escribir sidecar JSON
+    FS-->>IMG: JSON escrito
+    IMG->>WS: publish_event(capture_done, image_valid, sidecar_written, sidecar_path)
 
     Note over ORCH: Continuar con análisis
 ```
@@ -833,11 +851,11 @@ sequenceDiagram
 
         Note over IND: Exposición (3s)
 
-        IND-->>ADAPTER: setNumberVector(state=OK)
-        IND-->>ADAPTER: setBLOBVector(filename)
-        ADAPTER->>FS: Escribir sidecar JSON
-        ADAPTER->>WS: publish_event(capture_done, seq_index=1)
-        ADAPTER->>WS: publish_event(image_ready)
+        IND-->>ADAPTER: setNumberVector(state=OK) + setTextVector(CCD_IMAGE_FILE)
+        ADAPTER->>IMG: callbacks
+        IMG->>IMG: Validar FITS
+        IMG->>FS: Escribir sidecar JSON
+        IMG->>WS: publish_event(capture_done, image_valid, sidecar_written)
 
         Note over ADAPTER: Esperar hasta completar periodo (10s)
         Note over ADAPTER: Tiempo restante: 10s - 3s = 7s
@@ -1000,6 +1018,18 @@ curl http://localhost:8000/api/v1/camera/status
     "last_file": "cavex_0042.fits",
     "disk_free_gb": 450.2
   },
+  "last_capture": {
+    "capture_id": "exp_a1b2c3d4",
+    "job_id": "night_001",
+    "exptime_s": 3.0,
+    "file_path": "/data/2026-02-12/cavex_0042.fits",
+    "sidecar_path": "/data/2026-02-12/cavex_0042.json",
+    "image_valid": true,
+    "image_error": null,
+    "sidecar_written": true,
+    "ccd_temp_c": -10.2,
+    "completed_at": "2026-02-12T22:00:03.123Z"
+  },
   "lease": {
     "active": true,
     "lease_id": "lease_a1b2c3d4",
@@ -1009,6 +1039,8 @@ curl http://localhost:8000/api/v1/camera/status
   }
 }
 ```
+
+\`last_capture\` es \`null\` hasta que se complete la primera captura; tras ello contiene \`image_valid\`, \`sidecar_written\`, \`image_error\` (si la validación FITS falla).
 
 ### 7.4 WebSocket de Telemetría
 
@@ -1039,10 +1071,26 @@ ws.onmessage = (event) => {
 | Tipo | Frecuencia | Descripción |
 |------|------------|-------------|
 | \`telemetry_snapshot\` | 1-2 Hz | Estado completo (temperatura, progreso, config) |
-| \`capture_event\` | Discreto | Inicio/fin/fallo/abort de captura |
+| \`capture_event\` | Discreto | Inicio/fin/fallo/abort de captura. Para \`event: "capture_done"\` incluye \`image_valid\`, \`sidecar_written\`, \`sidecar_path\`, \`image_path\`, \`image_error\` |
 | \`lease_event\` | Discreto | Cambios en el lease (acquired/preempted/expired) |
 | \`alarm_event\` | Discreto | Alarmas (temperatura, cooler, disco) |
-| \`image_ready\` | Discreto | FITS + JSON disponibles para análisis |
+
+**Ejemplo \`capture_done\`**:
+```json
+{
+  "type": "capture_event",
+  "data": {
+    "event": "capture_done",
+    "exposure_id": "exp_a1b2c3d4",
+    "image_path": "/data/cavex_0042.fits",
+    "sidecar_path": "/data/cavex_0042.json",
+    "image_valid": true,
+    "image_error": null,
+    "sidecar_written": true,
+    "ccd_temp_c": -10.2
+  }
+}
+```
 
 ---
 
@@ -1504,8 +1552,8 @@ Las alarmas se publican por:
 
 **Flujo**:
 1. \`cavex_analysis\` se suscribe al WebSocket
-2. Recibe evento \`image_ready\` con \`image_path\` y \`sidecar_path\`
-3. Lee FITS y JSON desde el filesystem compartido
+2. Recibe evento \`capture_event\` con \`event: "capture_done"\`, \`image_path\`, \`sidecar_path\`, \`image_valid\`, \`sidecar_written\`
+3. Si \`image_valid\` es true, lee FITS y JSON desde el filesystem compartido
 4. Ejecuta fotometría y cálculo de extinción
 5. Publica resultados en InfluxDB
 
@@ -1583,8 +1631,8 @@ Las alarmas se publican por:
 
 ✅ **FITS + JSON sidecar**: Metadatos extendidos sin modificar FITS  
 ✅ **Escritura atómica**: Sin archivos corruptos  
-✅ **Evento \`image_ready\`**: Sin polling del filesystem  
-✅ **Bind mount**: Acceso directo sin overhead de red  
+✅ **Validación FITS (astropy)**: Campo \`image_valid\` en \`capture_done\`, sin polling  
+✅ **Bind mount**: Acceso directo sin overhead de red    
 
 ### 11.8 Observabilidad
 
@@ -1686,6 +1734,27 @@ sudo systemctl restart indigo
 # Verificar permisos USB
 sudo chmod 666 /dev/bus/usb/XXX/YYY
 ```
+
+#### Exposición no llega a INDIGO / "Another exposure in progress"
+
+**Síntomas**: \`POST /exposure/start\` devuelve 409 Conflict; o el comando no aparece en logs de INDIGO.
+
+**Orden de operaciones** (obligatorio):
+1. \`POST /lease/acquire\` con \`owner\`, \`priority\`, \`ttl_seconds\`
+2. \`POST /camera/connect\` (verificar \`device.connected: true\` en status)
+3. \`POST /camera/session\` (configurar \`storage_path\`, \`file_prefix\`, \`naming_pattern\`)
+4. \`POST /camera/exposure/start\`
+
+**Diagnóstico**:
+```bash
+# Verificar dispositivo conectado
+curl http://localhost:8000/api/v1/camera/status | jq '.device.connected'
+
+# Si exposure bloqueada, abortar y reintentar
+curl -X POST http://localhost:8000/api/v1/camera/exposure/abort -H "Content-Type: application/json" -d '{}'
+```
+
+**Causas comunes**: Dispositivo no conectado; sesión no configurada; nombre de dispositivo INDIGO distinto a \`device_name\` en config.
 
 #### Lease expirado constantemente
 

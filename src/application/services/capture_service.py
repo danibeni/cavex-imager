@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import os
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import structlog
@@ -13,11 +14,11 @@ from src.domain.exceptions.capture_exceptions import (
     HardwareError,
     NoActiveExposure,
 )
-from src.domain.exceptions.lease_exceptions import LeaseNotFound
 from src.domain.models.capture import Capture, CaptureStatus, FrameType
 from src.domain.models.image_metadata import ImageMetadata
 from src.domain.ports.camera_device import ICameraDevice
 from src.domain.ports.event_publisher import IEventPublisher
+from src.domain.ports.image_validator import IImageValidator
 from src.domain.ports.storage import IStorage
 
 logger = structlog.get_logger(__name__)
@@ -36,6 +37,7 @@ class CaptureService:
         storage: IStorage,
         event_publisher: IEventPublisher,
         lease_manager: LeaseManager,
+        image_validator: IImageValidator,
         service_version: str = "1.0.0",
     ) -> None:
         """Initialize capture service dependencies.
@@ -45,14 +47,23 @@ class CaptureService:
             storage: Sidecar storage port.
             event_publisher: Event publisher port.
             lease_manager: Lease manager service.
+            image_validator: FITS image validator port.
             service_version: Service version for sidecar metadata.
         """
         self._camera = camera
         self._storage = storage
         self._event_publisher = event_publisher
         self._lease_manager = lease_manager
+        self._image_validator = image_validator
         self._service_version = service_version
         self._current_capture: Capture | None = None
+        self._exposure_ok_received = False
+        self._pending_image_path: str | None = None
+
+        self._camera.subscribe_to_exposure_events(
+            on_state_changed=self._on_exposure_state_changed,
+            on_image_received=self._on_image_received,
+        )
 
     async def start_exposure(
         self,
@@ -75,7 +86,7 @@ class CaptureService:
             ExposureInProgress: If another exposure is running.
             HardwareError: If camera command fails.
         """
-        lease = self._lease_manager.require_lease(lease_id)
+        self._lease_manager.require_lease(lease_id)
 
         if self._current_capture and self._current_capture.status == CaptureStatus.EXPOSING:
             raise ExposureInProgress("Cannot start: another exposure is in progress.")
@@ -92,6 +103,8 @@ class CaptureService:
             job_id=job_id,
         )
         self._current_capture = capture
+        self._exposure_ok_received = False
+        self._pending_image_path = None
 
         try:
             await self._camera.start_exposure(exptime_s)
@@ -156,6 +169,7 @@ class CaptureService:
             service_version=self._service_version,
         )
 
+        image_valid, image_error = self._image_validator.validate(file_path)
         sidecar_ok = await self._storage.write_sidecar(fits_path=file_path, metadata=metadata)
         capture.mark_as_completed(file_path=file_path, sidecar_ok=sidecar_ok)
 
@@ -166,23 +180,27 @@ class CaptureService:
                 "job_id": capture.job_id,
                 "exptime_s": capture.exptime_s,
                 "file_path": file_path,
+                "sidecar_path": file_path.replace(".fits", ".json"),
+                "image_valid": image_valid,
+                "image_error": image_error,
                 "sidecar_written": sidecar_ok,
                 "ccd_temp_c": state.ccd_temp_c,
             },
         )
-        await self._event_publisher.publish(
-            "image.ready",
-            {
-                "capture_id": capture.id,
-                "image_path": file_path,
-                "sidecar_path": file_path.replace(".fits", ".json"),
-            },
-        )
 
-        if sidecar_ok:
+        if image_valid and sidecar_ok:
             logger.info("exposure_completed", capture_id=capture.id, file_path=file_path)
+        elif not image_valid:
+            logger.warning(
+                "exposure_completed_image_invalid",
+                capture_id=capture.id,
+                error=image_error,
+            )
         else:
             logger.warning("exposure_completed_sidecar_failed", capture_id=capture.id)
+
+        self._exposure_ok_received = False
+        self._pending_image_path = None
 
     async def handle_exposure_failed(self, error_message: str) -> None:
         """Called when INDIGO signals exposure failure.
@@ -200,6 +218,8 @@ class CaptureService:
             {"capture_id": capture.id, "error_message": error_message},
         )
         logger.error("exposure_failed", capture_id=capture.id, error=error_message)
+        self._exposure_ok_received = False
+        self._pending_image_path = None
 
     async def abort_exposure(self, lease_id: str) -> None:
         """Abort the current in-progress exposure.
@@ -224,7 +244,41 @@ class CaptureService:
             {"capture_id": self._current_capture.id},
         )
         logger.info("exposure_aborted", capture_id=self._current_capture.id)
+        self._exposure_ok_received = False
+        self._pending_image_path = None
 
     def get_current_capture(self) -> Capture | None:
         """Return the current capture reference."""
         return self._current_capture
+
+    async def _on_exposure_state_changed(self, previous: str, current: str) -> None:
+        """Handle camera exposure state transitions."""
+        previous_state = previous.upper()
+        current_state = current.upper()
+
+        if current_state == "ALERT":
+            await self.handle_exposure_failed("CCD_EXPOSURE entered ALERT state.")
+            return
+
+        if previous_state == "BUSY" and current_state == "OK":
+            self._exposure_ok_received = True
+            await self._try_complete_capture()
+
+    async def _on_image_received(self, file_path: str) -> None:
+        """Handle image path emitted by the camera adapter."""
+        if not os.path.isfile(file_path):
+            logger.warning("capture_image_missing", file_path=file_path)
+            await self.handle_exposure_failed(f"Image file not found: {file_path}")
+            return
+
+        self._pending_image_path = file_path
+        await self._try_complete_capture()
+
+    async def _try_complete_capture(self) -> None:
+        """Complete capture when state and image conditions are satisfied."""
+        capture = self._current_capture
+        if capture is None or capture.status != CaptureStatus.EXPOSING:
+            return
+
+        if self._exposure_ok_received and self._pending_image_path:
+            await self.handle_exposure_complete(self._pending_image_path)
