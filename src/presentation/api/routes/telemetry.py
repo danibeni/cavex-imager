@@ -1,24 +1,15 @@
 """Telemetry WebSocket route."""
 
 from __future__ import annotations
+import json
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from src.domain.ports.telemetry import ITelemetryPublisher
+from src.presentation.api.auth import is_valid_api_key
 from src.shared.config import Config
 
 router = APIRouter(prefix="/api/v1/ws", tags=["telemetry"])
-
-
-def _is_valid_api_key(config: Config, api_key: str | None) -> bool:
-    if not config.get("auth.enabled", False):
-        return True
-    if not api_key:
-        return False
-    for key_entry in config.get("auth.keys", []):
-        if key_entry.get("key") == api_key:
-            return True
-    return False
 
 
 @router.websocket("/telemetry")
@@ -43,17 +34,26 @@ async def telemetry_ws(
         return
 
     api_key = websocket.headers.get("x-api-key")
-    if not _is_valid_api_key(config, api_key):
+    if not is_valid_api_key(config, api_key):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid API key")
         return
 
-    connected = await telemetry_publisher.connect(websocket, rate_hz)  # type: ignore[attr-defined]
+    connected = await telemetry_publisher.connect(websocket, rate_hz)
     if not connected:
         await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER, reason="Max clients reached")
         return
 
     try:
         while True:
-            await websocket.receive_text()
+            raw_text = await websocket.receive_text()
+            try:
+                data = json.loads(raw_text)
+                if isinstance(data, dict) and data.get("action") == "subscribe":
+                    topics = data.get("topics", [])
+                    if isinstance(topics, list):
+                        telemetry_publisher.update_subscriptions(websocket, topics)
+            except json.JSONDecodeError:
+                pass
+                
     except WebSocketDisconnect:
-        telemetry_publisher.disconnect(websocket)  # type: ignore[attr-defined]
+        telemetry_publisher.disconnect(websocket)

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 from uuid import uuid4
 
 import structlog
@@ -32,6 +34,7 @@ class LeaseManager:
         default_ttl: int = 120,
         max_ttl: int = 600,
         preempt_mode: str = "graceful",
+        graceful_timeout_s: int = 60,
     ) -> None:
         """Initialize lease manager.
 
@@ -40,12 +43,27 @@ class LeaseManager:
             default_ttl: Default TTL in seconds.
             max_ttl: Maximum allowed TTL in seconds.
             preempt_mode: Preemption mode ('graceful' or 'abort').
+            graceful_timeout_s: Max seconds to wait for an in-progress exposure
+                before forcing preemption in graceful mode.
         """
         self._event_publisher = event_publisher
         self._current_lease: Lease | None = None
         self._default_ttl = default_ttl
         self._max_ttl = max_ttl
         self._preempt_mode = preempt_mode
+        self._graceful_timeout_s = graceful_timeout_s
+        self._is_exposing: Callable[[], bool] | None = None
+
+    def set_exposing_check(self, fn: Callable[[], bool]) -> None:
+        """Register a callback that returns True while an exposure is in progress.
+
+        Used by graceful preemption to wait for the current exposure to finish
+        before transferring control to the higher-priority client.
+
+        Args:
+            fn: Zero-argument callable returning bool.
+        """
+        self._is_exposing = fn
 
     async def acquire(
         self,
@@ -66,7 +84,8 @@ class LeaseManager:
         Raises:
             LeaseConflict: If existing lease has equal or higher priority.
         """
-        ttl = min(ttl_seconds or self._default_ttl, self._max_ttl)
+        permanent = ttl_seconds is None
+        ttl = None if permanent else min(ttl_seconds, self._max_ttl)
         existing = self.get_current_lease()
 
         if existing is not None:
@@ -81,6 +100,26 @@ class LeaseManager:
                 raise LeaseConflict(
                     f"Cannot acquire: existing lease has priority {existing.priority}"
                 )
+
+            # In graceful mode, wait for any active exposure to finish before
+            # transferring control. In abort mode, preempt immediately.
+            if self._preempt_mode == "graceful" and self._is_exposing is not None:
+                waited = 0.0
+                _poll_interval = 0.5
+                while self._is_exposing() and waited < self._graceful_timeout_s:
+                    logger.info(
+                        "graceful_preemption_waiting",
+                        new_owner=owner,
+                        waited_s=round(waited, 1),
+                    )
+                    await asyncio.sleep(_poll_interval)
+                    waited += _poll_interval
+                if self._is_exposing():
+                    logger.warning(
+                        "graceful_preemption_timeout",
+                        new_owner=owner,
+                        timeout_s=self._graceful_timeout_s,
+                    )
 
             # Preempt current lease
             old_owner = existing.owner
@@ -110,9 +149,10 @@ class LeaseManager:
             owner=owner,
             priority=priority,
             acquired_at=now,
-            expires_at=now + timedelta(seconds=ttl),
-            ttl_seconds=ttl,
+            expires_at=None if permanent else now + timedelta(seconds=ttl),  # type: ignore[arg-type]
+            ttl_seconds=None if permanent else ttl,
             status=LeaseStatus.ACTIVE,
+            permanent=permanent,
         )
         self._current_lease = lease
 
@@ -122,7 +162,8 @@ class LeaseManager:
                 "lease_id": lease.id,
                 "owner": lease.owner,
                 "priority": lease.priority,
-                "expires_at": lease.expires_at.isoformat(),
+                "expires_at": lease.expires_at.isoformat() if lease.expires_at else None,
+                "permanent": lease.permanent,
             },
         )
         logger.info("lease_acquired", lease_id=lease.id, owner=owner, priority=priority)
@@ -172,18 +213,22 @@ class LeaseManager:
             self._current_lease = None
             raise LeaseExpiredError("Cannot renew an expired lease.")
 
-        ttl = min(ttl_seconds or self._default_ttl, self._max_ttl)
-        lease.renew(ttl)
+        # Permanent leases do not need renewal but the call succeeds silently
+        if not lease.permanent:
+            ttl = min(ttl_seconds or self._default_ttl, self._max_ttl)
+            lease.renew(ttl)
 
+        expires_at_iso = lease.expires_at.isoformat() if lease.expires_at else None
         await self._event_publisher.publish(
             "lease.renewed",
             {
                 "lease_id": lease.id,
                 "owner": lease.owner,
-                "expires_at": lease.expires_at.isoformat(),
+                "expires_at": expires_at_iso,
+                "permanent": lease.permanent,
             },
         )
-        logger.info("lease_renewed", lease_id=lease.id, expires_at=lease.expires_at.isoformat())
+        logger.info("lease_renewed", lease_id=lease.id, expires_at=expires_at_iso)
         return lease
 
     def get_current_lease(self) -> Lease | None:

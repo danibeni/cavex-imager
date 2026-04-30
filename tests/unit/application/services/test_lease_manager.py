@@ -44,7 +44,6 @@ async def test_acquire_preempts_lower_priority_lease() -> None:
     new_lease = await mgr.acquire(owner="orchestrator", priority=100, ttl_seconds=300)
 
     assert old_lease.status is LeaseStatus.PREEMPTED
-    assert old_lease.preempted is True
     assert new_lease.owner == "orchestrator"
     assert new_lease.status is LeaseStatus.ACTIVE
     assert mgr.get_current_lease() is new_lease
@@ -175,7 +174,6 @@ def test_get_current_lease_returns_none_if_preempted() -> None:
         expires_at=now + timedelta(seconds=300),
         ttl_seconds=300,
         status=LeaseStatus.PREEMPTED,
-        preempted=True,
     )
 
     current = mgr.get_current_lease()
@@ -204,3 +202,39 @@ async def test_require_lease_raises_on_mismatch() -> None:
 
     with pytest.raises(LeaseNotFound):
         mgr.require_lease("wrong-id")
+
+
+@pytest.mark.asyncio
+async def test_renew_expired_lease_raises_lease_expired_error() -> None:
+    """Test renew raises LeaseExpiredError when lease is already expired."""
+    publisher = AsyncMock()
+    mgr = LeaseManager(event_publisher=publisher)
+    lease = await mgr.acquire(owner="test", priority=50, ttl_seconds=120)
+
+    # Force-expire the lease by backdating expires_at
+    from datetime import timedelta
+    lease.expires_at = lease.acquired_at - timedelta(seconds=1)
+
+    with pytest.raises(LeaseExpiredError):
+        await mgr.renew(lease.id)
+
+    assert mgr.get_current_lease() is None
+
+
+def test_preempt_mode_property_returns_configured_mode() -> None:
+    """Test preempt_mode property returns the value set at construction."""
+    publisher = AsyncMock()
+    mgr = LeaseManager(event_publisher=publisher, preempt_mode="abort")
+
+    assert mgr.preempt_mode == "abort"
+
+
+@pytest.mark.asyncio
+async def test_renew_raises_lease_not_found_on_wrong_id() -> None:
+    """Test renew raises LeaseNotFound when lease_id does not match active lease."""
+    publisher = AsyncMock()
+    mgr = LeaseManager(event_publisher=publisher)
+    await mgr.acquire(owner="test", priority=50, ttl_seconds=120)
+
+    with pytest.raises(LeaseNotFound):
+        await mgr.renew("wrong-lease-id")

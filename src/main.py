@@ -1,7 +1,7 @@
 """CAVEX Imager FastAPI application entrypoint."""
 
 from __future__ import annotations
-
+import os
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -10,14 +10,18 @@ from typing import Any
 import structlog
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
+from src.presentation.api.routes.preview import router as preview_router
 from src.application.services.capture_service import CaptureService
 from src.application.services.lease_manager import LeaseManager
 from src.infrastructure.adapters.indigo_camera_adapter import IndigoCameraAdapter
 from src.infrastructure.bus.internal_event_bus import InternalEventBus
 from src.infrastructure.persistence.sidecar_writer import SidecarWriter
 from src.infrastructure.validation.fits_validator import FitsValidator
+from src.presentation.api.auth import is_valid_api_key
 from src.presentation.api.errors import error_payload
 from src.presentation.api.routes.camera import router as camera_router
 from src.presentation.api.routes.health import router as health_router
@@ -40,23 +44,12 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _is_valid_api_key(config: Config, api_key: str | None) -> bool:
-    if not config.get("auth.enabled", False):
-        return True
-    if not api_key:
-        return False
-    for key_entry in config.get("auth.keys", []):
-        if key_entry.get("key") == api_key:
-            return True
-    return False
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle."""
     config = Config()
     setup_logging(
-        level=config.get("service.log_level", "INFO"),
+        level=os.getenv("LOG_LEVEL", config.get("service.log_level", "INFO")),
         file_enabled=config.get("logging.file.enabled", True),
         file_path=config.get("logging.file.path", "/data/logs/cavex_imager.log"),
         max_bytes=int(config.get("logging.file.max_bytes", 10_485_760)),
@@ -66,13 +59,14 @@ async def lifespan(app: FastAPI):
     event_bus = InternalEventBus()
     storage = SidecarWriter(min_free_gb=float(config.get("storage.min_free_gb", 10.0)))
     camera = IndigoCameraAdapter(
-        device_name=config.get("indigo.device_name", "CCD Imager Simulator")
+        device_name=str(config.get("indigo.device_name", "CCD Imager Simulator"))
     )
     lease_manager = LeaseManager(
         event_publisher=event_bus,
         default_ttl=int(config.get("lease.default_ttl_seconds", 120)),
         max_ttl=int(config.get("lease.max_ttl_seconds", 600)),
         preempt_mode=str(config.get("lease.preempt_mode", "graceful")),
+        graceful_timeout_s=int(config.get("lease.graceful_timeout_s", 60)),
     )
     capture_service = CaptureService(
         camera=camera,
@@ -82,10 +76,21 @@ async def lifespan(app: FastAPI):
         image_validator=FitsValidator(),
         service_version=str(config.get("service.version", "1.0.0")),
     )
+    lease_manager.set_exposing_check(capture_service.is_exposing)
+    session_cfg: dict = {
+        "session_id": None,
+        "storage_path": config.get("storage.host_base_path", "/opt/cavex/data"),
+        "file_prefix": config.get("storage.default_file_prefix", "cavex"),
+        "naming_pattern": config.get("storage.default_naming_pattern", "{prefix}_{seq:04d}.fits"),
+        "disk_free_gb": 0.0,
+        "last_file": None,
+    }
+
     telemetry = TelemetryHandler(
         camera=camera,
-        telemetry_publisher=None,
         max_clients=int(config.get("telemetry.max_ws_clients", 10)),
+        lease_manager=lease_manager,
+        session_config=session_cfg,
     )
 
     app.state.config = config
@@ -106,13 +111,7 @@ async def lifespan(app: FastAPI):
         "last_capture_duration_s": 0.0,
         "avg_capture_duration_s": 0.0,
     }
-    app.state.session_config = {
-        "session_id": None,
-        "storage_path": config.get("storage.host_base_path", "/opt/cavex/data"),
-        "file_prefix": config.get("storage.default_file_prefix", "cavex"),
-        "naming_pattern": config.get("storage.default_naming_pattern", "{prefix}_{seq:04d}.fits"),
-        "disk_free_gb": 0.0,
-    }
+    app.state.session_config = session_cfg
     app.state.sequence_state = {
         "running": False,
         "sequence_id": None,
@@ -140,6 +139,8 @@ async def lifespan(app: FastAPI):
         app.state.last_capture_status = "SUCCESS"
         app.state.metrics_cache["captures_total"] += 1
         captures_total.labels(status="completed").inc()
+        if payload.get("file_path"):
+            session_cfg["last_file"] = payload["file_path"].split("/")[-1]
         app.state.last_capture_result = {
             "capture_id": payload.get("capture_id"),
             "job_id": payload.get("job_id"),
@@ -208,12 +209,20 @@ async def lifespan(app: FastAPI):
         "lease.released", lambda payload: on_lease_event("lease_released", payload)
     )
 
-    indigo_host = config.get("indigo.host", "localhost")
-    indigo_port = int(config.get("indigo.port", 7624))
+    data_dir = str(config.get("storage.host_base_path", "/opt/cavex/data"))
+    os.makedirs(data_dir, exist_ok=True)
+
+    indigo_host = os.getenv("INDIGO_HOST", config.get("indigo.host", "localhost"))
+    indigo_port = int(os.getenv("INDIGO_PORT", config.get("indigo.port", 7624)))
     try:
+        storage_path = str(config.get("storage.host_base_path", "/opt/cavex/data"))
+        file_prefix = str(config.get("storage.default_file_prefix", "cavex"))
         await camera.connect(indigo_host, indigo_port)
+        await camera.set_local_mode(directory=storage_path, prefix=file_prefix)
+
         indigo_connected.set(1)
         device_connected.set(1 if camera.get_state().connected else 0)
+        logger.info("camera_local_mode_configured", directory=storage_path, prefix=file_prefix)
     except Exception as exc:
         indigo_connected.set(0)
         device_connected.set(0)
@@ -247,7 +256,110 @@ async def lifespan(app: FastAPI):
         logger.info("cavex_imager_stopped")
 
 
-app = FastAPI(title="CAVEX Imager", version="1.0.0", lifespan=lifespan)
+_DESCRIPTION = """
+## CAVEX Imager API
+
+REST/WebSocket service for controlling the reference astronomical camera of the
+**CAVEX** instrument (Calar Alto V-band EXtinction monitor).
+
+Provides an abstraction layer over the INDIGO protocol for image acquisition,
+concurrent access management (lease system), and real-time telemetry streaming.
+
+### Typical usage flow
+
+1. **`POST /api/v1/lease/acquire`** — Acquire an exclusive write lease on the camera.
+2. **`POST /api/v1/camera/connect`** — Connect the camera device via INDIGO.
+3. **`POST /api/v1/camera/config`** — Configure acquisition parameters (binning, ROI, gain, cooler).
+4. **`POST /api/v1/camera/exposure/start`** — Start an exposure (HTTP 202 Accepted, async operation).
+5. **`WS  /api/v1/ws/telemetry`** — Subscribe to real-time telemetry to monitor progress.
+6. **`POST /api/v1/lease/release`** — Release the lease when done.
+
+### Authentication
+
+When authentication is enabled (`auth.enabled: true` in `config/default.yaml`),
+all routes under `/api/v1/` require the `X-API-Key` header with a valid key.
+
+### WebSocket telemetry
+
+The `/api/v1/ws/telemetry` endpoint accepts a `rate_hz` query parameter (1 or 2)
+to control the update frequency. Clients may send
+`{"action": "subscribe", "topics": [...]}` for selective topic subscription.
+"""
+
+_OPENAPI_TAGS = [
+    {
+        "name": "health",
+        "description": "Service health and operational diagnostics.",
+    },
+    {
+        "name": "lease",
+        "description": (
+            "Exclusive lease management. "
+            "Ensures only one client holds write control over the camera at any given time. "
+            "Supports priority-based preemption and configurable TTLs."
+        ),
+    },
+    {
+        "name": "camera",
+        "description": (
+            "Camera device control: connection management, acquisition parameter configuration, "
+            "single exposures, and periodic sequences."
+        ),
+    },
+    {
+        "name": "telemetry",
+        "description": "Real-time telemetry WebSocket endpoint (up to 2 Hz).",
+    },
+    {
+        "name": "preview",
+        "description": "FITS image preview rendered as PNG with automatic contrast stretching.",
+    },
+]
+
+app = FastAPI(
+    title="CAVEX Imager",
+    version="1.0.0",
+    description=_DESCRIPTION,
+    contact={
+        "name": "Calar Alto Observatory — CAVEX Project",
+        "url": "https://www.caha.es",
+    },
+    license_info={"name": "MIT"},
+    openapi_tags=_OPENAPI_TAGS,
+    lifespan=lifespan,
+)
+
+
+def _custom_openapi() -> dict:
+    """Return the OpenAPI schema, injecting the API key security scheme."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        contact=app.contact,
+        license_info=app.license_info,
+        tags=app.openapi_tags,
+        routes=app.routes,
+    )
+    schema.setdefault("components", {})["securitySchemes"] = {
+        "ApiKeyAuth": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-API-Key",
+            "description": (
+                "API key for authentication. "
+                "Required when `auth.enabled: true` in the service configuration."
+            ),
+        }
+    }
+    schema["security"] = [{"ApiKeyAuth": []}]
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = _custom_openapi
 
 app.add_middleware(
     CORSMiddleware,
@@ -278,7 +390,7 @@ async def auth_middleware(request: Request, call_next):
     if request.url.path.startswith("/api/v1"):
         config: Config = request.app.state.config
         api_key = request.headers.get("x-api-key")
-        if not _is_valid_api_key(config, api_key):
+        if not is_valid_api_key(config, api_key):
             payload = error_payload(
                 "UNAUTHORIZED",
                 "Invalid API key.",
@@ -320,11 +432,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     request.app.state.last_errors.append(payload["error"])
     return JSONResponse(status_code=500, content=payload)
 
+app.mount("/captures", StaticFiles(directory="/opt/cavex/data"), name="data")
 
 app.include_router(health_router)
 app.include_router(lease_router)
 app.include_router(camera_router)
 app.include_router(telemetry_router)
+app.include_router(preview_router)
 
 
 @app.get("/")

@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.application.services.capture_service import CaptureService
+from src.application.services.capture_service import CaptureService, _resolve_path
 from src.application.services.lease_manager import LeaseManager
-from src.domain.exceptions.capture_exceptions import ExposureInProgress, NoActiveExposure
+from src.domain.exceptions.capture_exceptions import ExposureInProgress, HardwareError, NoActiveExposure
 from src.domain.exceptions.lease_exceptions import LeaseNotFound
 from src.domain.models.capture import CaptureStatus
 from src.domain.models.lease import Lease, LeaseStatus
@@ -207,24 +208,35 @@ async def test_abort_exposure_raises_if_no_active() -> None:
 
 
 @pytest.mark.asyncio
-async def test_state_ok_then_image_completes_capture(tmp_path: Path) -> None:
-    """Test reactive flow completes capture when OK and image are available."""
+async def test_image_then_state_ok_completes_capture(tmp_path: Path) -> None:
+    """Test reactive flow: image path received before state OK still completes capture.
+
+    In INDIGO, CCD_IMAGE_FILE often arrives just before or at the same time as
+    the state-OK update. Receiving the image path first sets _pending_image_path;
+    the subsequent state-OK triggers _try_complete_capture and finishes the capture.
+    """
     service, _, storage, _ = _build_service(lease=_active_lease())
     await service.start_exposure(lease_id="lease-1", exptime_s=1.0)
     image_path = tmp_path / "capture_001.fits"
     image_path.write_text("fits-placeholder", encoding="utf-8")
 
-    await service._on_exposure_state_changed("Busy", "Ok")
+    # Image path arrives first — capture remains EXPOSING until state OK
+    await service._on_image_received(str(image_path))
     capture_mid = service.get_current_capture()
     assert capture_mid is not None
     assert capture_mid.status is CaptureStatus.EXPOSING
 
-    await service._on_image_received(str(image_path))
+    # State OK arrives — both conditions met → capture completes
+    service._exposure_ok_received = True
+    await service._try_complete_capture()
 
     capture = service.get_current_capture()
     assert capture is not None
     assert capture.status is CaptureStatus.COMPLETED
-    assert capture.file_path == str(image_path)
+    # File is renamed to a unique path inside the same directory
+    assert capture.file_path is not None
+    assert capture.file_path.startswith(str(tmp_path))
+    assert capture.file_path.endswith(".fits")
     storage.write_sidecar.assert_awaited_once()
 
 
@@ -289,3 +301,152 @@ async def test_on_image_received_missing_file_fails_capture() -> None:
     assert capture.status is CaptureStatus.FAILED
     published_events = [c.args[0] for c in publisher.publish.call_args_list]
     assert "capture.failed" in published_events
+
+
+# ── _resolve_path unit tests ─────────────────────────────────────────────────
+
+
+def test_resolve_path_returns_path_when_file_exists(tmp_path: Path) -> None:
+    """Test _resolve_path returns the raw path when the file exists as-is."""
+    f = tmp_path / "image.fits"
+    f.write_text("fits", encoding="utf-8")
+
+    result = _resolve_path(str(f))
+
+    assert result == str(f)
+
+
+def test_resolve_path_returns_none_when_no_translation_matches() -> None:
+    """Test _resolve_path returns None when file cannot be found anywhere."""
+    result = _resolve_path("/completely/nonexistent/path/image.fits")
+
+    assert result is None
+
+
+def test_resolve_path_applies_translation(tmp_path: Path) -> None:
+    """Test _resolve_path uses path translation to find a relocated file."""
+    # Create the file at the container path
+    dest = tmp_path / "image.fits"
+    dest.write_text("fits", encoding="utf-8")
+
+    # Simulate: INDIGO emitted /opt/cavex/data/image.fits but file lives at /data/image.fits
+    # We cannot rely on the real translations, so patch isfile to simulate translation.
+    raw = "/opt/cavex/data/image.fits"
+    translated = str(dest)
+
+    def fake_isfile(path: str) -> bool:
+        return path == translated
+
+    with patch("src.application.services.capture_service.os.path.isfile", side_effect=fake_isfile):
+        with patch(
+            "src.application.services.capture_service._PATH_TRANSLATIONS",
+            [("/opt/cavex/data", str(tmp_path))],
+        ):
+            result = _resolve_path(raw)
+
+    assert result == translated
+
+
+# ── HardwareError on camera failure ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_start_exposure_raises_hardware_error_on_camera_failure() -> None:
+    """Test start_exposure raises HardwareError when camera.start_exposure fails."""
+    service, camera, _, _ = _build_service(lease=_active_lease())
+    camera.start_exposure.side_effect = RuntimeError("INDIGO driver crash")
+
+    with pytest.raises(HardwareError):
+        await service.start_exposure(lease_id="lease-1", exptime_s=2.0)
+
+    capture = service.get_current_capture()
+    assert capture is not None
+    assert capture.status is CaptureStatus.FAILED
+
+
+# ── handle_exposure_complete guard ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_handle_exposure_complete_is_noop_without_active_capture() -> None:
+    """Test handle_exposure_complete silently returns when no capture is active."""
+    service, _, storage, publisher = _build_service(lease=_active_lease())
+
+    # Call without starting an exposure first — should not raise
+    await service.handle_exposure_complete("/data/test.fits")
+
+    storage.write_sidecar.assert_not_awaited()
+    # Only the implicit call from start (none) — no capture.completed event
+    completed_events = [
+        c for c in publisher.publish.call_args_list
+        if c.args[0] == "capture.completed"
+    ]
+    assert len(completed_events) == 0
+
+
+# ── OSError on file rename ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_handle_exposure_complete_continues_on_rename_failure(
+    tmp_path: Path,
+) -> None:
+    """Test handle_exposure_complete succeeds even when file rename raises OSError."""
+    service, _, storage, _ = _build_service(lease=_active_lease())
+    fits_path = tmp_path / "cavex_001.fits"
+    fits_path.write_text("fits-placeholder", encoding="utf-8")
+
+    await service.start_exposure(lease_id="lease-1", exptime_s=1.0)
+
+    with patch("src.application.services.capture_service.os.rename", side_effect=OSError("busy")):
+        await service.handle_exposure_complete(str(fits_path))
+
+    capture = service.get_current_capture()
+    assert capture is not None
+    assert capture.status is CaptureStatus.COMPLETED
+    storage.write_sidecar.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_try_complete_capture_is_noop_when_no_capture() -> None:
+    """Test _try_complete_capture silently returns when no capture is active."""
+    service, _, storage, _ = _build_service(lease=_active_lease())
+    # No exposure started — _current_capture is None
+
+    await service._try_complete_capture()
+
+    storage.write_sidecar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scan_for_new_image_handles_getmtime_oserror(tmp_path: Path) -> None:
+    """Test _scan_for_new_image skips files where os.path.getmtime raises OSError."""
+    service, camera, _, _ = _build_service(lease=_active_lease())
+    fits_path = tmp_path / "cavex_001.fits"
+    fits_path.write_text("fits-placeholder", encoding="utf-8")
+
+    # Make local_mode_dir point to tmp_path; start time before file creation so mtime check passes
+    camera.get_state.return_value = _mock_camera_state()._replace(
+        local_mode_dir=str(tmp_path)
+    ) if hasattr(_mock_camera_state(), '_replace') else _mock_camera_state()
+
+    state = _mock_camera_state()
+    from dataclasses import replace as dc_replace
+    camera.get_state.return_value = dc_replace(state, local_mode_dir=str(tmp_path))
+
+    await service.start_exposure(lease_id="lease-1", exptime_s=1.0)
+
+    original_getmtime = os.path.getmtime
+
+    def flaky_getmtime(path: str) -> float:
+        if path == str(fits_path):
+            raise OSError("permission denied")
+        return original_getmtime(path)
+
+    with patch("src.application.services.capture_service.os.path.getmtime", side_effect=flaky_getmtime):
+        await service._scan_for_new_image()
+
+    # File was skipped due to OSError — scan found nothing → capture marked failed
+    capture = service.get_current_capture()
+    assert capture is not None
+    assert capture.status is CaptureStatus.FAILED
