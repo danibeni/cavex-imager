@@ -22,22 +22,19 @@ class TelemetryHandler(ITelemetryPublisher):
     def __init__(
         self,
         camera: ICameraDevice,
-        telemetry_publisher: ITelemetryPublisher | None = None,
         max_clients: int = 10,
+        lease_manager: Any | None = None,
+        session_config: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize handler.
-
-        Args:
-            camera: Camera device source for snapshots.
-            telemetry_publisher: Unused, kept for spec-compatible signature.
-            max_clients: Maximum connected clients.
-        """
+        """Initialize handler."""
         self._camera = camera
         self._max_clients = max_clients
         self._clients: list[WebSocket] = []
         self._rate_by_client: dict[WebSocket, int] = {}
+        self._subscriptions_by_client: dict[WebSocket, set[str]] = {}
         self._tick = 0
-        _ = telemetry_publisher
+        self._lease_manager = lease_manager
+        self._session_config = session_config if session_config is not None else {}
 
     @staticmethod
     def _utc_now_iso() -> str:
@@ -45,6 +42,36 @@ class TelemetryHandler(ITelemetryPublisher):
 
     def _envelope(self, message_type: str, data: dict[str, Any]) -> dict[str, Any]:
         return {"type": message_type, "timestamp": self._utc_now_iso(), "data": data}
+
+    def _lease_data(self) -> dict[str, Any]:
+        _empty: dict[str, Any] = {
+            "active": False, "lease_id": None, "owner": None, "priority": None,
+            "acquired_at": None, "expires_at": None, "expires_in_s": None, "permanent": False,
+        }
+        if self._lease_manager is None:
+            return _empty
+        lease = self._lease_manager.get_current_lease()
+        if lease is None:
+            return _empty
+        remaining = lease.remaining_seconds()
+        return {
+            "active": True,
+            "lease_id": lease.id,
+            "owner": lease.owner,
+            "priority": lease.priority,
+            "acquired_at": lease.acquired_at.isoformat(),
+            "expires_at": lease.expires_at.isoformat() if lease.expires_at else None,
+            "expires_in_s": round(remaining, 1) if remaining is not None else None,
+            "permanent": lease.permanent,
+        }
+
+    def _storage_data(self) -> dict[str, Any]:
+        cfg = self._session_config
+        return {
+            "storage_path": cfg.get("storage_path", "/opt/cavex/data"),
+            "disk_free_gb": cfg.get("disk_free_gb", 0.0),
+            "last_file": cfg.get("last_file"),
+        }
 
     def _snapshot_data(self) -> dict[str, Any]:
         state = self._camera.get_state()
@@ -79,6 +106,8 @@ class TelemetryHandler(ITelemetryPublisher):
                 "gain": state.gain,
                 "offset": state.offset,
             },
+            "lease": self._lease_data(),
+            "storage": self._storage_data(),
         }
 
     async def connect(self, websocket: WebSocket, rate_hz: int) -> bool:
@@ -102,6 +131,7 @@ class TelemetryHandler(ITelemetryPublisher):
         if websocket in self._clients:
             self._clients.remove(websocket)
         self._rate_by_client.pop(websocket, None)
+        self._subscriptions_by_client.pop(websocket, None)
         ws_clients_connected.set(len(self._clients))
         logger.info("telemetry_ws_disconnected clients=%s", len(self._clients))
 
@@ -121,6 +151,11 @@ class TelemetryHandler(ITelemetryPublisher):
             if websocket.application_state != WebSocketState.CONNECTED:
                 to_remove.append(websocket)
                 continue
+            
+            subs = self._subscriptions_by_client.get(websocket, set())
+            if subs and payload.get("type") not in subs:
+                continue
+
             try:
                 await websocket.send_json(payload)
             except Exception:
@@ -137,16 +172,33 @@ class TelemetryHandler(ITelemetryPublisher):
         """Broadcast a discrete telemetry event."""
         await self._broadcast_json(self._envelope(event_type, payload))
 
+    def update_subscriptions(self, websocket: WebSocket, topics: list[str]) -> None:
+        """Update the topic subscriptions for a specific client."""
+        if websocket in self._clients:
+            if not topics or "*" in topics:
+                self._subscriptions_by_client[websocket] = set()
+            else:
+                self._subscriptions_by_client[websocket] = set(topics)
+            logger.info("telemetry_ws_subscribed clients=%s topics=%s", len(self._clients), topics)
+
     async def _broadcast_json(self, message: dict[str, Any]) -> None:
         to_remove: list[WebSocket] = []
+        message_type = message.get("type", "unknown")
+
         for websocket in list(self._clients):
             if websocket.application_state != WebSocketState.CONNECTED:
                 to_remove.append(websocket)
                 continue
+
+            subs = self._subscriptions_by_client.get(websocket, set())
+            if subs and message_type not in subs:
+                continue
+
             try:
                 await websocket.send_json(message)
             except Exception:
                 to_remove.append(websocket)
+                
         for websocket in to_remove:
             self.disconnect(websocket)
 

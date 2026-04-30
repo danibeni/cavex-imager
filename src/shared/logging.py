@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -36,7 +37,7 @@ def setup_logging(
     root_logger.handlers.clear()
 
     # Stdout handler (JSON via structlog)
-    stdout_handler = logging.StreamHandler()
+    stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setLevel(normalized_level)
     root_logger.addHandler(stdout_handler)
 

@@ -6,7 +6,7 @@ service:
 indigo:
   host: localhost
   port: 7624
-  device_name: "CCD Imager Simulator"
+  device_name: "(null) Logitech StreamCam"
   reconnect:
     enabled: true
     max_attempts: 0  # 0 = infinite
@@ -20,6 +20,7 @@ lease:
   preempt_mode: graceful  # graceful | abort
   default_ttl_seconds: 120
   max_ttl_seconds: 600
+  graceful_timeout_s: 60  # max seconds to wait for exposure before forcing preemption
 
 storage:
   host_base_path: /opt/cavex/data
@@ -37,7 +38,7 @@ logging:
     enabled: true
     format: json
   file:
-    enabled: true
+    enabled: false
     path: /data/logs/cavex_imager.log
     max_bytes: 10485760  # 10MB
     backup_count: 5

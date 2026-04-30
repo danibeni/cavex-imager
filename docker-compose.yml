@@ -1,0 +1,43 @@
+services:
+
+  cavex-imager:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: cavex_imager_service
+    ports:
+      - "8000:8000"
+    environment:
+      - INDIGO_HOST=host.docker.internal
+      - INDIGO_PORT=7624
+      - LOG_LEVEL=INFO
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    volumes:
+      - /opt/cavex/data:/opt/cavex/data
+      - /home/xtrxty/indigo_image_cache:/home/xtrxty/indigo_image_cache:ro
+      - cavex_logs:/data/logs
+      - ./config:/app/config:ro
+
+  cavex-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cavex_imager_frontend
+    ports:
+      - "80:80"
+    depends_on:
+      cavex-imager:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  cavex_logs:
+    driver: local

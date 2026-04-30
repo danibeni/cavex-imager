@@ -448,8 +448,12 @@ async def test_on_update_ccd_image_file_notifies_image_handlers(
 
 
 @pytest.mark.asyncio
-async def test_on_update_ccd_image_file_skips_missing_file_handler_call() -> None:
-    """Test adapter does not emit image callback for missing files."""
+async def test_on_update_ccd_image_file_emits_callback_for_all_paths() -> None:
+    """Test adapter always emits image callback regardless of file existence.
+
+    File-existence checking is intentionally delegated to CaptureService, which
+    implements retry logic and host↔container path translation.
+    """
     adapter = _make_adapter()
     on_image_received = AsyncMock()
     adapter.subscribe_to_exposure_events(on_image_received=on_image_received)
@@ -461,7 +465,7 @@ async def test_on_update_ccd_image_file_skips_missing_file_handler_call() -> Non
 
     await adapter._on_property_updated(prop)
 
-    on_image_received.assert_not_awaited()
+    on_image_received.assert_awaited_once_with("/tmp/missing_capture_001.fits")
 
 
 @pytest.mark.asyncio
@@ -626,7 +630,8 @@ def test_reset_cache_clears_all_values() -> None:
     assert adapter._gain is None
     assert adapter._offset is None
     assert adapter._last_image_path is None
-    assert adapter._local_mode_dir is None
+    # NOTE: _local_mode_dir is intentionally NOT reset — it is preserved across
+    # disconnects so that set_local_mode can be re-applied on reconnection.
 
 
 # ── get_state Snapshot Tests ─────────────────────────────────────────────────

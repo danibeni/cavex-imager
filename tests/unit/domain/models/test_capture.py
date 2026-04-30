@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 from src.domain.models.capture import Capture, CaptureStatus, FrameType
 
 
@@ -84,3 +86,55 @@ def test_mark_as_aborted_updates_status() -> None:
 
     assert capture.status is CaptureStatus.ABORTED
     assert capture.completed_at is not None
+
+
+def test_invalid_status_raises_value_error() -> None:
+    """Test that passing a raw string as status raises ValueError."""
+    with pytest.raises(ValueError, match="status"):
+        Capture(
+            id="c1",
+            lease_id="l1",
+            exptime_s=5.0,
+            frame_type=FrameType.LIGHT,
+            binning=(1, 1),
+            status="pending",  # type: ignore[arg-type]
+        )
+
+
+def test_invalid_frame_type_raises_value_error() -> None:
+    """Test that passing a raw string as frame_type raises ValueError."""
+    with pytest.raises(ValueError, match="frame_type"):
+        Capture(
+            id="c1",
+            lease_id="l1",
+            exptime_s=5.0,
+            frame_type="LIGHT",  # type: ignore[arg-type]
+            binning=(1, 1),
+            status=CaptureStatus.PENDING,
+        )
+
+
+def test_zero_exptime_raises_value_error() -> None:
+    """Test that exptime_s=0 raises ValueError."""
+    with pytest.raises(ValueError, match="exptime_s"):
+        Capture(
+            id="c1",
+            lease_id="l1",
+            exptime_s=0.0,
+            frame_type=FrameType.LIGHT,
+            binning=(1, 1),
+            status=CaptureStatus.PENDING,
+        )
+
+
+def test_invalid_binning_raises_value_error() -> None:
+    """Test that binning with a zero value raises ValueError."""
+    with pytest.raises(ValueError, match="binning"):
+        Capture(
+            id="c1",
+            lease_id="l1",
+            exptime_s=1.0,
+            frame_type=FrameType.LIGHT,
+            binning=(0, 1),
+            status=CaptureStatus.PENDING,
+        )

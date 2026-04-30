@@ -31,7 +31,6 @@ def test_lease_creation_with_valid_values() -> None:
     assert lease.priority == 100
     assert lease.ttl_seconds == 300
     assert lease.status is LeaseStatus.ACTIVE
-    assert lease.preempted is False
 
 
 def test_is_expired_returns_true_when_expired() -> None:
@@ -102,7 +101,6 @@ def test_mark_preempted_updates_state() -> None:
     lease.mark_preempted()
 
     assert lease.status is LeaseStatus.PREEMPTED
-    assert lease.preempted is True
 
 
 def test_remaining_seconds_returns_positive_value() -> None:
@@ -183,3 +181,59 @@ def test_ttl_validation_rejects_zero() -> None:
             ttl_seconds=0,
             status=LeaseStatus.ACTIVE,
         )
+
+
+def test_permanent_lease_never_expires() -> None:
+    """Test that a permanent lease (ttl_seconds=None) never reports as expired."""
+    now = _now()
+    lease = Lease(
+        id="lease-perm",
+        owner="orchestrator",
+        priority=100,
+        acquired_at=now,
+        expires_at=None,
+        ttl_seconds=None,
+        status=LeaseStatus.ACTIVE,
+        permanent=True,
+    )
+
+    assert lease.is_expired() is False
+
+
+def test_permanent_lease_remaining_seconds_is_none() -> None:
+    """Test that remaining_seconds returns None for a permanent lease."""
+    now = _now()
+    lease = Lease(
+        id="lease-perm",
+        owner="orchestrator",
+        priority=100,
+        acquired_at=now,
+        expires_at=None,
+        ttl_seconds=None,
+        status=LeaseStatus.ACTIVE,
+        permanent=True,
+    )
+
+    assert lease.remaining_seconds() is None
+
+
+def test_renew_converts_permanent_lease_to_timed() -> None:
+    """Test that renewing a permanent lease makes it time-limited."""
+    now = _now()
+    lease = Lease(
+        id="lease-perm",
+        owner="orchestrator",
+        priority=100,
+        acquired_at=now,
+        expires_at=None,
+        ttl_seconds=None,
+        status=LeaseStatus.ACTIVE,
+        permanent=True,
+    )
+
+    lease.renew(ttl_seconds=120)
+
+    assert lease.permanent is False
+    assert lease.ttl_seconds == 120
+    assert lease.expires_at is not None
+    assert lease.remaining_seconds() > 0

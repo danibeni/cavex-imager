@@ -26,13 +26,23 @@ def _correlation_id(request: Request) -> str | None:
     return getattr(request.state, "correlation_id", None)
 
 
-@router.post("/acquire", response_model=LeaseResponse)
+@router.post(
+    "/acquire",
+    response_model=LeaseResponse,
+    summary="Acquire an exclusive lease",
+    responses={409: {"description": "A lease with equal or higher priority is already active."}},
+)
 async def acquire_lease(
     payload: LeaseAcquireRequest,
     request: Request,
     lease_manager: LeaseManager = Depends(get_lease_manager),
 ) -> LeaseResponse:
-    """Acquire an exclusive lease."""
+    """Request exclusive write control over the camera.
+
+    If an active lease exists with **lower priority**, it is preempted and replaced
+    by the new one. If the existing lease has **equal or higher priority**, HTTP 409
+    is returned.
+    """
     try:
         lease = await lease_manager.acquire(
             owner=payload.owner,
@@ -60,16 +70,21 @@ async def acquire_lease(
         priority=lease.priority,
         acquired_at=lease.acquired_at,
         expires_at=lease.expires_at,
+        permanent=lease.permanent,
     )
 
 
-@router.post("/renew")
+@router.post("/renew", summary="Renew an active lease")
 async def renew_lease(
     payload: LeaseRenewRequest,
     request: Request,
     lease_manager: LeaseManager = Depends(get_lease_manager),
 ) -> dict[str, Any]:
-    """Renew active lease TTL."""
+    """Extend the TTL of an active lease from the current time.
+
+    Must be called before the lease expires to avoid losing control of the camera.
+    Returns HTTP 403 if the lease ID does not match or the lease has already expired.
+    """
     try:
         lease = await lease_manager.renew(payload.lease_id, payload.ttl_seconds)
     except (LeaseNotFound, LeaseExpiredError) as exc:
@@ -80,13 +95,17 @@ async def renew_lease(
     return {"lease_id": lease.id, "expires_at": lease.expires_at}
 
 
-@router.post("/release")
+@router.post("/release", summary="Release an active lease")
 async def release_lease(
     payload: LeaseReleaseRequest,
     request: Request,
     lease_manager: LeaseManager = Depends(get_lease_manager),
 ) -> dict[str, Any]:
-    """Release active lease."""
+    """Explicitly release a lease, freeing the camera for other clients.
+
+    Should always be called when the client no longer needs camera access,
+    rather than waiting for the TTL to expire.
+    """
     try:
         await lease_manager.release(payload.lease_id)
     except LeaseNotFound as exc:
@@ -97,15 +116,20 @@ async def release_lease(
     return {"released": True, "released_at": utc_now_iso()}
 
 
-@router.get("/status", response_model=LeaseStatusResponse)
+@router.get("/status", response_model=LeaseStatusResponse, summary="Get current lease status")
 async def lease_status(
     lease_manager: LeaseManager = Depends(get_lease_manager),
 ) -> LeaseStatusResponse:
-    """Return current lease status."""
+    """Return the current lease status, including the holder, priority, and time remaining.
+
+    Returns `active: false` when no lease is currently held.
+    """
     lease = lease_manager.get_current_lease()
     if lease is None:
         return LeaseStatusResponse(active=False)
-    expires_in_s = max(0.0, (lease.expires_at - datetime.now(timezone.utc)).total_seconds())
+    expires_in_s = None if lease.permanent else max(
+        0.0, (lease.expires_at - datetime.now(timezone.utc)).total_seconds()  # type: ignore[operator]
+    )
     return LeaseStatusResponse(
         active=True,
         lease_id=lease.id,

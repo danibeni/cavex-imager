@@ -106,13 +106,18 @@ def _require_active_lease(lease_manager: LeaseManager, request: Request) -> str:
     return lease.id
 
 
-@router.get("/status")
+@router.get("/status", summary="Get full camera status snapshot")
 async def camera_status(
     request: Request,
     camera: ICameraDevice = Depends(get_camera),
     lease_manager: LeaseManager = Depends(get_lease_manager),
 ) -> dict:
-    """Return complete camera status snapshot from local cache."""
+    """Return a complete snapshot of the camera state from the local INDIGO cache.
+
+    Includes device connection state, exposure progress, thermal readings,
+    acquisition configuration, storage session, and active lease information.
+    No hardware polling is performed; the state is updated asynchronously by the INDIGO adapter.
+    """
     state = camera.get_state()
     lease = lease_manager.get_current_lease()
     now = datetime.now(timezone.utc)
@@ -196,14 +201,17 @@ async def camera_capabilities(camera: ICameraDevice = Depends(get_camera)) -> di
     }
 
 
-@router.post("/connect")
+@router.post("/connect", summary="Connect the camera device")
 async def camera_connect(
     _: ConnectRequest,
     request: Request,
     camera: ICameraDevice = Depends(get_camera),
     lease_manager: LeaseManager = Depends(get_lease_manager),
 ) -> dict:
-    """Connect camera device."""
+    """Send a connect command to the INDIGO camera device.
+
+    Requires an active lease. Returns HTTP 503 if the INDIGO server is unreachable.
+    """
     _require_active_lease(lease_manager, request)
     try:
         await camera.connect_device()
@@ -216,14 +224,14 @@ async def camera_connect(
     return {"device": state.device_name, "connected": True, "connected_at": utc_now_iso()}
 
 
-@router.post("/disconnect")
+@router.post("/disconnect", summary="Disconnect the camera device")
 async def camera_disconnect(
     _: DisconnectRequest,
     request: Request,
     camera: ICameraDevice = Depends(get_camera),
     lease_manager: LeaseManager = Depends(get_lease_manager),
 ) -> dict:
-    """Disconnect camera device."""
+    """Send a disconnect command to the INDIGO camera device. Requires an active lease."""
     _require_active_lease(lease_manager, request)
     await camera.disconnect_device()
     state = camera.get_state()
@@ -234,7 +242,11 @@ async def camera_disconnect(
     }
 
 
-@router.post("/config")
+@router.post(
+    "/config",
+    summary="Apply acquisition configuration",
+    responses={409: {"description": "Cannot change configuration while an exposure is in progress."}},
+)
 async def camera_config(
     payload: CameraConfigRequest,
     request: Request,
@@ -242,7 +254,11 @@ async def camera_config(
     capture_service: CaptureService = Depends(get_capture_service),
     lease_manager: LeaseManager = Depends(get_lease_manager),
 ) -> dict:
-    """Apply acquisition configuration."""
+    """Apply acquisition parameters to the camera. All fields are optional; only provided fields are updated.
+
+    Requires an active lease. Returns HTTP 409 if an exposure is currently in progress.
+    Configurable parameters: `binning` (x/y), `roi` (x/y/width/height), `gain`, `offset`, `cooler` (enabled/target_c).
+    """
     _require_active_lease(lease_manager, request)
     current = capture_service.get_current_capture()
     if current is not None and current.status.value == "exposing":
@@ -319,13 +335,14 @@ async def camera_session(
         )
 
     await camera.set_local_mode(payload.storage_path, payload.file_prefix)
-    request.app.state.session_config = {
+    # Update in-place so TelemetryHandler's reference stays valid
+    request.app.state.session_config.update({
         "session_id": f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}",
         "storage_path": payload.storage_path,
         "file_prefix": payload.file_prefix,
         "naming_pattern": payload.naming_pattern,
         "disk_free_gb": round(validation.disk_free_gb, 3),
-    }
+    })
     disk_free_gb.set(validation.disk_free_gb)
     return {
         "session_id": request.app.state.session_config["session_id"],
@@ -336,7 +353,15 @@ async def camera_session(
 
 
 @router.post(
-    "/exposure/start", status_code=status.HTTP_202_ACCEPTED, response_model=ExposureStartResponse
+    "/exposure/start",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=ExposureStartResponse,
+    summary="Start a single exposure",
+    responses={
+        202: {"description": "Exposure accepted and started asynchronously."},
+        403: {"description": "No active lease."},
+        409: {"description": "An exposure is already in progress."},
+    },
 )
 async def exposure_start(
     payload: ExposureStartRequest,
@@ -344,11 +369,20 @@ async def exposure_start(
     capture_service: CaptureService = Depends(get_capture_service),
     lease_manager: LeaseManager = Depends(get_lease_manager),
 ) -> ExposureStartResponse:
-    """Start single exposure."""
+    """Initiate a single camera exposure asynchronously.
+
+    Returns HTTP 202 immediately. Monitor completion via the WebSocket telemetry endpoint
+    (`/api/v1/ws/telemetry`) listening for `capture_event` messages with `event: capture_done`.
+
+    Requires an active lease. Returns HTTP 409 if an exposure is already running.
+    """
     lease_id = _require_active_lease(lease_manager, request)
     try:
         capture = await capture_service.start_exposure(
-            lease_id=lease_id, exptime_s=payload.exptime_s, job_id=payload.job_id
+            lease_id=lease_id,
+            exptime_s=payload.exptime_s,
+            frame_type=payload.frame_type,
+            job_id=payload.job_id,
         )
     except LeaseNotFound as exc:
         raise HTTPException(
@@ -375,14 +409,17 @@ async def exposure_start(
     )
 
 
-@router.post("/exposure/abort")
+@router.post("/exposure/abort", summary="Abort an in-progress exposure")
 async def exposure_abort(
     _: ExposureAbortRequest,
     request: Request,
     capture_service: CaptureService = Depends(get_capture_service),
     lease_manager: LeaseManager = Depends(get_lease_manager),
 ) -> dict:
-    """Abort active exposure."""
+    """Send an abort command to cancel the currently running exposure.
+
+    Requires an active lease. Returns HTTP 409 if no exposure is currently in progress.
+    """
     lease_id = _require_active_lease(lease_manager, request)
     try:
         await capture_service.abort_exposure(lease_id)
@@ -448,6 +485,50 @@ async def sequence_stop(payload: SequenceStopRequest, request: Request) -> dict:
         "stopped": True,
         "stopped_at": utc_now_iso(),
         "completed_count": state["completed_count"],
+    }
+
+
+@router.get(
+    "/image/latest",
+    summary="Get metadata of the latest captured image",
+    responses={
+        200: {"description": "Latest image metadata."},
+        404: {"description": "No image has been captured yet in this session."},
+    },
+)
+async def get_latest_image(request: Request) -> dict:
+    """Return metadata for the most recent image captured in this session.
+
+    - **local_path**: Absolute path on the server's filesystem where the FITS file is stored.
+    - **image_url**: URL provided by the connected camera server (INDIGO blob URL).
+      Non-null only when `CCD_UPLOAD_MODE` is `client` or `both` in INDIGO.
+    - **captured_at**: UTC ISO-8601 timestamp of capture completion.
+    - **format**: Image file format (always `FITS` for science images).
+    """
+    last = request.app.state.last_capture_result
+    if last is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=error_payload(
+                "NOT_FOUND",
+                "No image has been captured in this session.",
+                _correlation_id(request),
+            ),
+        )
+
+    file_path: str | None = last.get("file_path")
+    filename = file_path.split("/")[-1] if file_path else None
+    preview_url = f"/api/v1/preview/{filename}" if filename else None
+
+    return {
+        "local_path": file_path,
+        "image_url": preview_url,
+        "captured_at": last.get("completed_at"),
+        "format": "FITS",
+        "capture_id": last.get("capture_id"),
+        "job_id": last.get("job_id"),
+        "exptime_s": last.get("exptime_s"),
+        "image_valid": last.get("image_valid"),
     }
 
 

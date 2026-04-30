@@ -24,10 +24,10 @@ class Lease:
     owner: str
     priority: int
     acquired_at: datetime
-    expires_at: datetime
-    ttl_seconds: int
+    expires_at: datetime | None  # None for permanent leases
+    ttl_seconds: int | None  # None for permanent leases
     status: LeaseStatus
-    preempted: bool = field(default=False)
+    permanent: bool = field(default=False)
 
     def __post_init__(self) -> None:
         """Validate lease invariants after construction."""
@@ -35,8 +35,8 @@ class Lease:
             raise ValueError("status must be an instance of LeaseStatus")
         if self.priority < 0:
             raise ValueError("priority must be non-negative")
-        if self.ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive")
+        if not self.permanent and (self.ttl_seconds is None or self.ttl_seconds <= 0):
+            raise ValueError("ttl_seconds must be positive for non-permanent leases")
 
     @staticmethod
     def now_utc() -> datetime:
@@ -44,8 +44,13 @@ class Lease:
         return datetime.now(timezone.utc)
 
     def is_expired(self) -> bool:
-        """Check whether the lease expiration time has passed."""
-        return self.now_utc() > self.expires_at
+        """Check whether the lease expiration time has passed.
+
+        Permanent leases never expire.
+        """
+        if self.permanent:
+            return False
+        return self.now_utc() > self.expires_at  # type: ignore[operator]
 
     def renew(self, ttl_seconds: int) -> None:
         """Extend lease expiration from current time.
@@ -56,13 +61,15 @@ class Lease:
         now = self.now_utc()
         self.ttl_seconds = ttl_seconds
         self.expires_at = now + timedelta(seconds=ttl_seconds)
+        self.permanent = False
 
     def mark_preempted(self) -> None:
         """Mark lease as preempted by a higher-priority client."""
         self.status = LeaseStatus.PREEMPTED
-        self.preempted = True
 
-    def remaining_seconds(self) -> float:
-        """Return seconds until expiration, zero if expired."""
-        delta = (self.expires_at - self.now_utc()).total_seconds()
+    def remaining_seconds(self) -> float | None:
+        """Return seconds until expiration, zero if expired, None if permanent."""
+        if self.permanent:
+            return None
+        delta = (self.expires_at - self.now_utc()).total_seconds()  # type: ignore[operator]
         return max(0.0, delta)
